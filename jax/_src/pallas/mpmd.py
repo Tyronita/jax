@@ -188,8 +188,9 @@ def _mpmd_map_discharge_rule(
       jax_core.extend_axis_env_nd(super_mesh_shape.items()),
       config._check_vma(False),
   ):
-    for jaxpr in jaxprs:
-      new_jaxprs.append(_rewrite_to_include_new_outputs(jaxpr))
+    for mesh, jaxpr in zip(meshes, jaxprs):
+      with mesh.tracing_context():
+        new_jaxprs.append(_rewrite_to_include_new_outputs(jaxpr))
 
   new_out_avals = [avals_in[i].inner_aval for i in write_indices]
   updated_out_avals = list(avals_out) + new_out_avals
@@ -197,6 +198,12 @@ def _mpmd_map_discharge_rule(
   new_aliases = dict(input_output_aliases)
   for out_idx, in_idx in enumerate(write_indices):
     new_aliases[in_idx] = num_out_orig + out_idx
+  if debug:
+    print("discharged mpmd_map")
+    for mesh, jaxpr in zip(meshes, new_jaxprs):
+      print(f"mesh: {mesh}")
+      print(f"new_jaxpr: {jaxpr}")
+    print(f"new_aliases: {new_aliases}")
 
   res = mpmd_map_p.bind(
       *args,
@@ -274,11 +281,12 @@ def _mpmd_map_to_lojax(
       jax_core.extend_axis_env_nd(super_mesh_shape.items()),
       config._check_vma(False),
   ):
-    for jaxpr in jaxprs:
-      closed_jaxpr = jax_core.ClosedJaxpr(jaxpr, ())
-      closed_lo_jaxpr = pe.lower_jaxpr2(closed_jaxpr)
-      assert not closed_lo_jaxpr.consts
-      lo_jaxprs.append(closed_lo_jaxpr.jaxpr)
+    for mesh, jaxpr in zip(meshes, jaxprs):
+      with mesh.tracing_context():
+        closed_jaxpr = jax_core.ClosedJaxpr(jaxpr, ())
+        closed_lo_jaxpr = pe.lower_jaxpr2(closed_jaxpr)
+        assert not closed_lo_jaxpr.consts
+        lo_jaxprs.append(closed_lo_jaxpr.jaxpr)
 
   input_index_mapping = pallas_call._get_index_mapping(in_avals)
   output_index_mapping = pallas_call._get_index_mapping(out_avals)
@@ -329,7 +337,6 @@ def _mpmd_map_tpu_lowering(
     from jax._src.pallas.mosaic import pallas_call_registration
   except ImportError:
     raise pallas_call._unsupported_lowering_error("tpu")
-  num_scratch = len(jaxprs[0].invars) - len(in_nodes) - len(ctx.avals_out)
   return pallas_call_registration.mpmd_map_tpu_lowering_rule(
       ctx,
       *in_nodes,
@@ -344,7 +351,6 @@ def _mpmd_map_tpu_lowering(
       metadata=metadata,
       name=name,
       external_meshes=external_meshes,
-      num_scratch=num_scratch,
   )
 
 
@@ -379,7 +385,11 @@ def _mpmd_map_fallback_lowering(
       compiler_params = compiler_params.replace(
           dimension_semantics=mesh.dimension_semantics
       )
-    if hasattr(mesh, "core_type"):
+    if (
+        hasattr(mesh, "core_type")
+        and mesh.core_type is not None
+        and hasattr(compiler_params, "kernel_type")
+    ):
       compiler_params = compiler_params.replace(kernel_type=mesh.core_type)
 
   num_scratch = len(jaxpr.invars) - len(in_nodes) - len(out_avals)
@@ -570,6 +580,7 @@ def _dedup_consts_and_unify_jaxpr_signatures(
     unflat_out_avals: Sequence[jax_core.AbstractValue],
     flat_kernel_avals: Sequence[jax_core.AbstractValue],
     super_mesh_shape: Mapping[str, int],
+    meshes: Sequence[pallas_core.Mesh],
 ) -> tuple[list[jax_core.Jaxpr], list[Array]]:
   # Example:
   #   c1, c2, c3 are closed-over refs.
@@ -626,7 +637,7 @@ def _dedup_consts_and_unify_jaxpr_signatures(
       + out_avals_flat
       + scratch_avals_flat
   )
-  for jaxpr, consts in zip(jaxprs, consts_per_fn):
+  for mesh, jaxpr, consts in zip(meshes, jaxprs, consts_per_fn):
     debug_info = api_util.debug_info(
         "mpmd_map_closed_over",
         make_rewritten_body(jaxpr, consts),
@@ -636,8 +647,11 @@ def _dedup_consts_and_unify_jaxpr_signatures(
     wrapped_fun = lu.wrap_init(
         make_rewritten_body(jaxpr, consts), debug_info=debug_info
     )
-    with (jax_core.extend_axis_env_nd(super_mesh_shape.items()),
-          config._check_vma(False)):
+    with (
+        jax_core.extend_axis_env_nd(super_mesh_shape.items()),
+        mesh.tracing_context(),
+        config._check_vma(False),
+    ):
       new_jaxpr, _, new_consts = pe.trace_to_jaxpr_dynamic(
           wrapped_fun, tracing_avals
       )
@@ -776,15 +790,18 @@ def _mpmd_map(
 
     jaxprs: list[jax_core.Jaxpr] = []
     consts_per_fn = []
-    for _, fn in meshes_and_fns:
+    for mesh, fn in meshes_and_fns:
       debug_info = api_util.debug_info("mpmd_map", fn, flat_kernel_avals, {})
       if name is not None:
         debug_info = debug_info.replace_func_name(name)
       flat_fun, out_tree_thunk = api_util.flatten_fun(
           lu.wrap_init(fn, debug_info=debug_info), kernel_aval_tree
       )
-      with (jax_core.extend_axis_env_nd(super_mesh_shape.items()),
-            config._check_vma(False)):
+      with (
+          jax_core.extend_axis_env_nd(super_mesh_shape.items()),
+          mesh.tracing_context(),
+          config._check_vma(False),
+      ):
         jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(
             flat_fun, flat_kernel_avals
         )
@@ -804,7 +821,7 @@ def _mpmd_map(
       # deduplicate them and then unify the jaxpr signatures.
       jaxprs, consts = _dedup_consts_and_unify_jaxpr_signatures(
           jaxprs, consts_per_fn, flat_args, unflat_in_avals, unflat_out_avals,
-          flat_kernel_avals, super_mesh_shape
+          flat_kernel_avals, super_mesh_shape, meshes
       )
     else:
       consts: list[Array] = []

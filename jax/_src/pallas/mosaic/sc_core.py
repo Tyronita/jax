@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import collections
 from collections.abc import Sequence
+import contextlib
 import dataclasses
 from typing import Any, TypeAlias
 
@@ -171,6 +172,10 @@ class ScalarSubcoreMesh(pallas_core.Mesh):
         tpu_core.MemorySpace.SEMAPHORE,
     ]
 
+  @contextlib.contextmanager
+  def tracing_context(self):
+    yield
+
 
 def _scalar_subcore_mesh_discharge_rule(
     in_avals,
@@ -311,6 +316,9 @@ class VectorSubcoreMesh(pallas_core.Mesh):
         tpu_core.MemorySpace.SEMAPHORE,
     ]
 
+  @contextlib.contextmanager
+  def tracing_context(self):
+    yield
 
 def _vector_subcore_mesh_discharge_rule(
     in_avals,
