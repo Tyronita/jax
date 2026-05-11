@@ -21,7 +21,7 @@ from collections.abc import Sequence
 import dataclasses
 import enum
 import math
-from typing import Any, assert_never, final
+from typing import Any, TYPE_CHECKING, assert_never, cast, final
 
 import numpy as np
 
@@ -67,12 +67,8 @@ class Variable:
     return f"V({self.key})"
 
 
-class Constant(abc.ABC):
-  """A constant is a known layout."""
-
-
 @dataclasses.dataclass(frozen=True)
-class RegisterLayout(Constant):
+class RegisterLayout:
   """Wraps a known register layout."""
 
   value: fa.FragmentedLayout
@@ -82,7 +78,7 @@ class RegisterLayout(Constant):
 
 
 @dataclasses.dataclass(frozen=True)
-class TMEMLayout(Constant):
+class TMEMLayout:
   """Wraps a known TMEM layout."""
 
   value: tcgen05.TMEMLayout
@@ -92,7 +88,7 @@ class TMEMLayout(Constant):
 
 
 @dataclasses.dataclass(frozen=True)
-class SMEMTiling(Constant):
+class SMEMTiling:
   """Wraps a known SMEM Tile Transform.
 
   If an SMEM reference may, in principle, have transforms but should not be
@@ -103,6 +99,9 @@ class SMEMTiling(Constant):
 
   def __str__(self):
     return f"C({self.value})"
+
+
+Constant = RegisterLayout | TMEMLayout | SMEMTiling
 
 
 @dataclasses.dataclass(frozen=True)
@@ -279,7 +278,7 @@ def reduce_expression(
 ) -> Expression | Unsatisfiable:
   """Reduces an expression as much as is possible given a set of known variable assignments."""
   match expr:
-    case Constant():
+    case RegisterLayout() | TMEMLayout() | SMEMTiling():
       return expr
     case Variable():
       return assignments.get(expr, expr)
@@ -293,18 +292,58 @@ def reduce_expression(
       assert_never(expr)
 
 
+class BaseConstraint(abc.ABC):
+
+  @property
+  @abc.abstractmethod
+  def _expressions(self) -> tuple[Expression, ...]:
+    """Returns the expressions this constraint depends on."""
+
+  def holds(self) -> bool | None:
+    return (
+        self._constant_holds()
+        if all(isinstance(e, Constant) for e in self._expressions)
+        else None
+    )
+
+  @abc.abstractmethod
+  def _constant_holds(self) -> bool:
+    """Evaluates the constraint when all dependent expressions are constants."""
+
+
 @dataclasses.dataclass(frozen=True)
-class Equals:
+class AlwaysTrue(BaseConstraint):
+  def holds(self) -> bool | None:
+    return True
+
+  def canonicalize(self) -> Constraint:
+    return self
+
+  def _constant_holds(self) -> bool:
+    raise NotImplementedError
+
+  @property
+  def _expressions(self):
+    raise NotImplementedError
+
+
+@dataclasses.dataclass(frozen=True)
+class Equals(BaseConstraint):
   """States that `lhs` and `rhs` are equal."""
   lhs: Expression
   rhs: Expression
 
-  def holds(self) -> bool | None:
-    if self.lhs == self.rhs:
-      return True
-    if isinstance(self.lhs, Constant) and isinstance(self.rhs, Constant):
-      return False
-    return None
+  @property
+  def _expressions(self) -> tuple[Expression, ...]:
+    return (self.lhs, self.rhs)
+
+  def __new__(cls, lhs, rhs):
+    if lhs == rhs:
+      return AlwaysTrue()
+    return super().__new__(cls)
+
+  def _constant_holds(self) -> bool:
+    return False
 
   def __str__(self):
     return f"Equals({self.lhs} == {self.rhs})"
@@ -341,7 +380,7 @@ def _is_supported_tiled_relayout(
 
 
 @dataclasses.dataclass(frozen=True)
-class Relayout:
+class Relayout(BaseConstraint):
   """States that `source` must be relayout-able to `target`.
 
   Relayout-ability here is not defined as a fundamental property of layouts, but
@@ -365,6 +404,11 @@ class Relayout:
   bitwidth: int
   strict: bool = False
 
+  def __new__(cls, source, target, bitwidth, strict=False):
+    if source == target:
+      return AlwaysTrue()
+    return super().__new__(cls)
+
   def canonicalize(self) -> Constraint:
     match self:
       # The only valid strict tiled and strided relayout is the identity.
@@ -379,22 +423,20 @@ class Relayout:
       case _:
         return self
 
-  def holds(self) -> bool | None:
-    """Returns whether the relayout constraint holds.
+  @property
+  def _expressions(self) -> tuple[Expression, ...]:
+    return (self.source, self.target)
 
-    Returns `None` if the constraint can't be checked.
-    """
-    source = self.source
-    target = self.target
-
-    # Fast path for syntactically identical expressions.
-    if source == target:
-      return True
+  def _constant_holds(self) -> bool:
+    source, target = self._expressions
 
     if not isinstance(source, RegisterLayout) or not isinstance(
         target, RegisterLayout
     ):
-      return None
+      raise ValueError(
+          f"Relayout can only be applied to registers, got source {self.source}"
+          f" to {self.target}"
+      )
 
     source_layout, target_layout = source.value, target.value
     match source_layout, target_layout:
@@ -416,18 +458,15 @@ class Relayout:
 
 
 @dataclasses.dataclass(frozen=True)
-class IsTransferable(abc.ABC):
+class IsTransferable(BaseConstraint, abc.ABC):
   """States that `source` layout must be transferable across memory spaces to `target` layout."""
   source: Expression
   target: Expression
   shape: tuple[int, ...]
 
-  def holds(self) -> bool | None:
-    """Returns whether the constraint holds.
-
-    Returns `None` if the constraint can't be checked.
-    """
-    raise NotImplementedError("Holds must be implemented by subclasses.")
+  @property
+  def _expressions(self) -> tuple[Expression, ...]:
+    return (self.source, self.target)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -478,19 +517,18 @@ class IsTransferableTmemRegisters(IsTransferable):
       return True
     return False
 
-  def holds(self) -> bool | None:
-    match self.source, self.target:
+  def _constant_holds(self) -> bool:
+    source, target = self._expressions
+    match source, target:
       case RegisterLayout(value=src), TMEMLayout(value=dst):
         return self.is_valid_tmem_transfer(dst, src)
       case TMEMLayout(value=src), RegisterLayout(value=dst):
         return self.is_valid_tmem_transfer(src, dst)
-      case Constant(), Constant():
+      case _:
         raise ValueError(
             f"{self.source} -> {self.target} is not a TMEM <-> Registers"
             " transfer."
         )
-      case _:
-        return None
 
   def __str__(self):
     return f"IsTransferableTmemRegisters({self.source} ⟶ {self.target})"
@@ -590,48 +628,46 @@ class IsTransferableSmemRegisters(IsTransferable):
     except fa.TransferPlanDerivationError:
       return False
 
-  def holds(self) -> bool | None:
-    match self.source, self.target:
+  def _constant_holds(self) -> bool:
+    source, target = self._expressions
+    match source, target:
       case SMEMTiling(value=src), RegisterLayout(value=dst):
         return self._is_supported_smem_transfer(src, dst)
       case RegisterLayout(value=src), SMEMTiling(value=dst):
         return self._is_supported_smem_transfer(dst, src)
-      case Constant(), Constant():
+      case _:
         raise ValueError(
             f"{self.source} -> {self.target} is not a SMEM <-> Registers"
             " transfer."
         )
-      case _:
-        return None
 
   def __str__(self):
     return f"IsTransferableSmemRegisters({self.source} ⟶ {self.target})"
 
 
 @dataclasses.dataclass(frozen=True)
-class NotOfType:
+class NotOfType(BaseConstraint):
   """States that `expr` is not an instance of `type`."""
 
   expr: Expression
   type: type[fa.FragmentedLayout]
 
-  def holds(self) -> bool | None:
-    """Whether the distinctiveness constraint holds.
+  @property
+  def _expressions(self) -> tuple[Expression, ...]:
+    return (self.expr,)
 
-    Returns `None` if the constraint can't be checked.
-    """
-    if not isinstance(self.expr, Constant):
-      return None
-    if not isinstance(self.expr, RegisterLayout):
+  def _constant_holds(self) -> bool:
+    [expr] = self._expressions
+    if not isinstance(expr, RegisterLayout):
       return True
-    return not isinstance(self.expr.value, self.type)
+    return not isinstance(expr.value, self.type)
 
   def __str__(self):
     return f"type({self.expr}) ≠ {self.type.__name__}"
 
 
 @dataclasses.dataclass(frozen=True)
-class Divides:
+class Divides(BaseConstraint):
   """States that the `expr` tiling is a divisor of `tiling_multiple`.
 
   That is to say that, for each tiled dimension in `expr`, the dimension must
@@ -651,8 +687,14 @@ class Divides:
   expr: Expression
   tiling_multiple: tuple[int, ...]
 
-  def holds(self) -> bool | None:
-    match self.expr:
+  @property
+  def _expressions(self) -> tuple[Expression, ...]:
+    return (self.expr,)
+
+  def _constant_holds(self) -> bool:
+    [expr] = self._expressions
+    assert isinstance(expr, Constant)
+    match expr:
       case SMEMTiling(value=None):
         # If there is no tiling, then this holds trivially.
         return True
@@ -666,8 +708,10 @@ class Divides:
         tiling = layout.base_tile_shape
       case TMEMLayout(value):
         tiling = value.base_tile_shape
-      case _:
-        return None
+      case SMEMTiling() | RegisterLayout():
+        raise ValueError(f"Unhandled expression: {expr}")
+      case _ as never:
+        assert_never(never)
 
     if len(tiling) > len(self.tiling_multiple):
       # The rank of the tiling is larger than the rank of the constraint. This
@@ -684,7 +728,7 @@ class Divides:
 
 
 @dataclasses.dataclass(frozen=True)
-class MinorDimDivisibleBy:
+class MinorDimDivisibleBy(BaseConstraint):
   """States that the minor dimension of the `expr` tiling is divisible by `divisor`.
 
   If the last dimension is untiled, then `true` is returned.
@@ -694,16 +738,24 @@ class MinorDimDivisibleBy:
   expr: Expression
   divisor: int
 
-  def holds(self) -> bool | None:
-    match self.expr:
+  @property
+  def _expressions(self) -> tuple[Expression, ...]:
+    return (self.expr,)
+
+  def _constant_holds(self) -> bool:
+    [expr] = self._expressions
+    assert isinstance(expr, Constant)
+    match expr:
       case SMEMTiling(value=None):
         return True
       case SMEMTiling(value=lc.TileTransform(tiling=t)):
         tiling = t
-      case Constant() as c:
-        raise ValueError(f"Unexpected value {c} in MinorDimDivisibleBy constraint")
-      case _:
-        return None
+      case RegisterLayout() | SMEMTiling() | TMEMLayout():
+        raise ValueError(
+            f"Unexpected expression {expr} in MinorDimDivisibleBy constraint"
+        )
+      case _ as never:
+        assert_never(never)
 
     if not tiling:
       return True
@@ -715,7 +767,7 @@ class MinorDimDivisibleBy:
 
 
 @dataclasses.dataclass(frozen=True)
-class IsValidMmaTiling:
+class IsValidMmaTiling(BaseConstraint):
   """States that the `expr` SMEM tiling must be compatible with MMA requirements.
 
   For both tcgen05.mma and wgmma, tiling is valid if it is of the form
@@ -730,25 +782,31 @@ class IsValidMmaTiling:
   bitwidth: int
   allow_unswizzled: bool = False
 
-  def holds(self) -> bool | None:
-    match self.expr:
+  @property
+  def _expressions(self) -> tuple[Expression, ...]:
+    return (self.expr,)
+
+  def _constant_holds(self) -> bool:
+    [expr] = self._expressions
+    assert isinstance(expr, Constant)
+    match expr:
       case SMEMTiling(value=None):
         return False
       case SMEMTiling(value=lc.TileTransform(tiling=t)):
         swizzles = [16, 32, 64, 128] if self.allow_unswizzled else [32, 64, 128]
         valid_tilings = {(8, s * 8 // self.bitwidth) for s in swizzles}
         return t in valid_tilings
-      case RegisterLayout() | TMEMLayout() as c:
-        raise ValueError(f"Unexpected value {c} in IsValidMmaTiling constraint")
-      case _:
-        return None
+      case RegisterLayout() | TMEMLayout() | SMEMTiling():
+        raise ValueError(f"Unexpected value {expr} in IsValidMmaTiling constraint")
+      case _ as never:
+        assert_never(never)
 
   def __str__(self):
     return f"IsValidMMATiling({self.expr}, {self.bitwidth}, allow_unswizzled={self.allow_unswizzled})"
 
 
 @dataclasses.dataclass(frozen=True)
-class IsSupportedBroadcast:
+class IsSupportedBroadcast(BaseConstraint):
   """States that `src` can be broadcasted to `dst`.
 
   See `FragmentedArray.broadcast_in_dim` for more details.
@@ -758,8 +816,14 @@ class IsSupportedBroadcast:
   dst: Expression
   dims: tuple[int, ...]
 
-  def holds(self) -> bool | None:
-    match self.src, self.dst:
+  @property
+  def _expressions(self) -> tuple[Expression, ...]:
+    return (self.src, self.dst)
+
+  def _constant_holds(self) -> bool:
+    src, dst = self._expressions
+    assert isinstance(src, Constant) and isinstance(dst, Constant)
+    match src, dst:
       case RegisterLayout(
           value=fa.WGStridedFragLayout() as src_layout
       ), RegisterLayout(value=fa.WGStridedFragLayout() as dst_layout):
@@ -768,13 +832,11 @@ class IsSupportedBroadcast:
         # This is an intentionally loose check. We rely on the presence of a
         # `src = Reduce(dst)` constraint to enforce correctness.
         return type(src_layout) == type(dst_layout)
-      case Constant() as src, Constant() as dst:
+      case _:
         raise ValueError(
             f"Unexpected values {src=} {dst=} in IsSupportedBroadcast"
             " constraint"
         )
-      case _:
-        return None
 
   def __str__(self):
     return (
@@ -792,7 +854,11 @@ Constraint = (
     | Divides
     | IsSupportedBroadcast
     | MinorDimDivisibleBy
+    | AlwaysTrue
 )
+
+if TYPE_CHECKING:
+  _: BaseConstraint = cast(Constraint, None)
 
 
 def reduce_constraint(
@@ -854,6 +920,8 @@ def reduce_constraint(
       ):
         return Unsatisfiable()
       return IsSupportedBroadcast(src_red, dst_red, dims)
+    case AlwaysTrue():
+      return AlwaysTrue()
     case _ as never:
       assert_never(never)
 
@@ -882,7 +950,7 @@ class ConstraintSystem:
           if expr not in seen_variables and expr not in self.assignments:
             seen_variables.add(expr)
             free_variables.append(expr)
-        case Constant():
+        case cst if isinstance(cst, Constant):
           ...
         case Reduce(expression=e):
           extract_variables(e)
@@ -890,6 +958,8 @@ class ConstraintSystem:
           extract_variables(e)
         case Transpose(expression=e):
           extract_variables(e)
+        case AlwaysTrue():
+          ...
         case _:
           assert_never(never)
     for constraint in self.constraints:
@@ -914,6 +984,8 @@ class ConstraintSystem:
         case IsSupportedBroadcast(src=src, dst=dst):
           extract_variables(src)
           extract_variables(dst)
+        case AlwaysTrue():
+          ...
         case _ as never:
           assert_never(never)
     return free_variables
@@ -1209,13 +1281,15 @@ def _reduce_system_once(
     match reduce_constraint(constraint, assignments):
       case Unsatisfiable():
         return Unsatisfiable()
-      case Equals(lhs=Variable() as var, rhs=Constant() as cst):
+      case Equals(lhs=Variable() as var, rhs=cst) if isinstance(cst, Constant):
         if not try_assign(var, cst):
           return Unsatisfiable()
         changed = True
-      case Equals(lhs=Constant() as cst, rhs=Variable() as var):
+      case Equals(lhs=cst, rhs=Variable() as var) if isinstance(cst, Constant):
         if not try_assign(var, cst):
           return Unsatisfiable()
+        changed = True
+      case AlwaysTrue():
         changed = True
       case new_constraint:
         match new_constraint.holds():  # pyrefly: ignore[missing-attribute]
