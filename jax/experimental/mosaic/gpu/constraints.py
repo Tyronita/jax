@@ -294,14 +294,26 @@ def reduce_expression(
 
 
 @dataclasses.dataclass(frozen=True)
+class AlwaysTrue:
+  def holds(self) -> bool | None:
+    return True
+
+  def canonicalize(self) -> Constraint:
+    return self
+
+
+@dataclasses.dataclass(frozen=True)
 class Equals:
   """States that `lhs` and `rhs` are equal."""
   lhs: Expression
   rhs: Expression
 
+  def __new__(cls, lhs, rhs):
+    if lhs == rhs:
+      return AlwaysTrue()
+    return super().__new__(cls)
+
   def holds(self) -> bool | None:
-    if self.lhs == self.rhs:
-      return True
     if isinstance(self.lhs, Constant) and isinstance(self.rhs, Constant):
       return False
     return None
@@ -365,6 +377,11 @@ class Relayout:
   bitwidth: int
   strict: bool = False
 
+  def __new__(cls, source, target, bitwidth, strict=False):
+    if source == target:
+      return AlwaysTrue()
+    return super().__new__(cls)
+
   def canonicalize(self) -> Constraint:
     match self:
       # The only valid strict tiled and strided relayout is the identity.
@@ -386,10 +403,6 @@ class Relayout:
     """
     source = self.source
     target = self.target
-
-    # Fast path for syntactically identical expressions.
-    if source == target:
-      return True
 
     if not isinstance(source, RegisterLayout) or not isinstance(
         target, RegisterLayout
@@ -792,6 +805,7 @@ Constraint = (
     | Divides
     | IsSupportedBroadcast
     | MinorDimDivisibleBy
+    | AlwaysTrue
 )
 
 
@@ -854,6 +868,8 @@ def reduce_constraint(
       ):
         return Unsatisfiable()
       return IsSupportedBroadcast(src_red, dst_red, dims)
+    case AlwaysTrue():
+      return AlwaysTrue()
     case _ as never:
       assert_never(never)
 
@@ -890,6 +906,8 @@ class ConstraintSystem:
           extract_variables(e)
         case Transpose(expression=e):
           extract_variables(e)
+        case AlwaysTrue():
+          ...
         case _:
           assert_never(never)
     for constraint in self.constraints:
@@ -914,6 +932,8 @@ class ConstraintSystem:
         case IsSupportedBroadcast(src=src, dst=dst):
           extract_variables(src)
           extract_variables(dst)
+        case AlwaysTrue():
+          ...
         case _ as never:
           assert_never(never)
     return free_variables
@@ -1216,6 +1236,8 @@ def _reduce_system_once(
       case Equals(lhs=Constant() as cst, rhs=Variable() as var):
         if not try_assign(var, cst):
           return Unsatisfiable()
+        changed = True
+      case AlwaysTrue():
         changed = True
       case new_constraint:
         match new_constraint.holds():  # pyrefly: ignore[missing-attribute]
