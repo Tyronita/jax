@@ -18,6 +18,7 @@ from collections.abc import Callable, Sequence
 import dataclasses
 from functools import update_wrapper, reduce, partial, wraps
 from typing import Any, Generic, TypeVar
+import itertools as it
 
 from jax._src import config
 from jax._src import core
@@ -386,16 +387,44 @@ class CustomJVPCallPrimitive(core.Primitive):
   skip_canonicalization = True
 
   def bind_with_trace(self, trace, args, avals, params, /):
+    if trace.requires_low and self.is_high(*avals, **params):
+      with core.set_current_trace(trace):
+        return self.to_lojax(*args, **params)
     params = dict(params)
+    params.pop('call_jaxpr', None)
     fun, jvp = params.pop('subfuns')
     return trace.process_custom_jvp_call(self, fun, jvp, args, **params)
+
+  def to_lojax(self, *hi_args, call_jaxpr, **params):
+    lo_closed_jaxpr = pe.lower_jaxpr2(call_jaxpr)
+    lo_args = [lo_val for aval, x in zip(call_jaxpr.in_aval_qdds, hi_args)
+               for lo_val in (aval.read_loval(x) if aval.has_qdd  # pyrefly: ignore[missing-attribute]
+                              else aval.lower_val(x))]  # pyrefly: ignore[missing-attribute]
+
+    all_outs = core.eval_jaxpr(lo_closed_jaxpr.jaxpr, lo_closed_jaxpr.consts, *lo_args)
+
+    lo_muts_out = sum(len(aval.lo_ty()) for aval in call_jaxpr.final_aval_qdds if aval.has_qdd)
+    out_mut, lo_outs = split_list(all_outs, [lo_muts_out])
+
+    out_mut_ = iter(out_mut)
+    in_idx = {v: i for i, v in enumerate(call_jaxpr.jaxpr.invars)}
+    for v in call_jaxpr.jaxpr.invars:
+      if (qdd := v.final_qdd) is not None:
+        lo_vals = it.islice(out_mut_, len(v.aval.lo_ty_qdd(qdd)))
+        v.aval.update_from_loval(qdd, hi_args[in_idx[v]], *lo_vals)  # pyrefly: ignore[missing-attribute]
+
+    lo_outs_ = iter(lo_outs)
+    hi_outs = [t.raise_val(*it.islice(lo_outs_, len(t.lo_ty())))
+               for t in call_jaxpr.out_avals]
+    assert next(lo_outs_, None) is None
+    return hi_outs
 
   def impl(self, fun, _, *args):
     raise NotImplementedError
 
   def get_bind_params(self, params):
     new_params = dict(params)
-    call_jaxpr: core.ClosedJaxpr = new_params.pop('call_jaxpr')
+    call_jaxpr: core.ClosedJaxpr = new_params['call_jaxpr']
     num_consts: int = new_params.pop('num_consts')
     jvp_jaxpr_fun = new_params.pop('jvp_jaxpr_fun')
     fun = lu.wrap_init(core.jaxpr_as_fun(call_jaxpr),
@@ -423,6 +452,7 @@ def lift_jvp(num_consts: int, jvp_jaxpr_fun: lu.WrappedFun) -> lu.WrappedFun:
   return lu.wrap_init(jvp, debug_info=jvp_jaxpr_fun.debug_info)
 
 custom_jvp_call_p = CustomJVPCallPrimitive('custom_jvp_call')
+custom_jvp_call_p.is_high = lambda *_, call_jaxpr=None, **__: call_jaxpr.is_high if call_jaxpr is not None else False
 
 def _custom_jvp_call_typecheck(_, *in_avals, call_jaxpr, jvp_jaxpr_fun,
                                num_consts, symbolic_zeros):
@@ -988,16 +1018,44 @@ class CustomVJPCallPrimitive(core.Primitive):
   skip_canonicalization = True
 
   def bind_with_trace(self, trace, args, avals, params, /):
+    if trace.requires_low and self.is_high(*avals, **params):
+      with core.set_current_trace(trace):
+        return self.to_lojax(*args, **params)  # pyrefly: ignore[not-callable]
     params = dict(params)
+    params.pop('call_jaxpr', None)
     fun, fwd, bwd = params.pop('subfuns')
     return trace.process_custom_vjp_call(self, fun, fwd, bwd, args, **params)
+
+  def to_lojax(self, *hi_args, call_jaxpr, **params):
+    lo_closed_jaxpr = pe.lower_jaxpr2(call_jaxpr)
+    lo_args = [lo_val for aval, x in zip(call_jaxpr.in_aval_qdds, hi_args)
+               for lo_val in (aval.read_loval(x) if aval.has_qdd  # pyrefly: ignore[missing-attribute]
+                              else aval.lower_val(x))]  # pyrefly: ignore[missing-attribute]
+
+    all_outs = core.eval_jaxpr(lo_closed_jaxpr.jaxpr, lo_closed_jaxpr.consts, *lo_args)
+
+    lo_muts_out = sum(len(aval.lo_ty()) for aval in call_jaxpr.final_aval_qdds if aval.has_qdd)
+    out_mut, lo_outs = split_list(all_outs, [lo_muts_out])
+
+    out_mut_ = iter(out_mut)
+    in_idx = {v: i for i, v in enumerate(call_jaxpr.jaxpr.invars)}
+    for v in call_jaxpr.jaxpr.invars:
+      if (qdd := v.final_qdd) is not None:
+        lo_vals = it.islice(out_mut_, len(v.aval.lo_ty_qdd(qdd)))
+        v.aval.update_from_loval(qdd, hi_args[in_idx[v]], *lo_vals)  # pyrefly: ignore[missing-attribute]
+
+    lo_outs_ = iter(lo_outs)
+    hi_outs = [t.raise_val(*it.islice(lo_outs_, len(t.lo_ty())))
+               for t in call_jaxpr.out_avals]
+    assert next(lo_outs_, None) is None
+    return hi_outs
 
   def impl(self, fun, fwd, bwd, *args):
     raise NotImplementedError
 
   def get_bind_params(self, params):
     new_params = dict(params)
-    call_jaxpr: core.ClosedJaxpr = new_params.pop('call_jaxpr')
+    call_jaxpr: core.ClosedJaxpr = new_params['call_jaxpr']
     num_consts: int = new_params.pop('num_consts')
     fwd_jaxpr_thunk = new_params.pop('fwd_jaxpr_thunk')
     fun = lu.wrap_init(core.jaxpr_as_fun(call_jaxpr),
@@ -1024,6 +1082,7 @@ def _handle_consts_in_bwd(f, const_avals, *args):
   return [Zero(a) for a in const_avals] + list(f(*args))
 
 custom_vjp_call_p = CustomVJPCallPrimitive('custom_vjp_call')
+custom_vjp_call_p.is_high = lambda *_, call_jaxpr=None, **__: call_jaxpr.is_high if call_jaxpr is not None else False
 # TODO(phawkins,mattjj): make this primitive cacheable.
 mlir.register_lowering(custom_vjp_call_p, _custom_jvp_vjp_call_lowering,
                        cacheable=False)
@@ -1826,8 +1885,36 @@ def _remat_opt_dce(used_outs: list[bool], eqn: core.JaxprEqn):
     used_ins = [False] * eqn.params["num_consts"] + used_ins
     return used_ins, new_eqn
 
+def _remat_opt_to_lojax(*hi_args, fwd_jaxpr, num_consts, **params):
+  lo_fwd_jaxpr = pe.lower_jaxpr2(fwd_jaxpr)
+  lo_args = [lo_val for aval, x in zip(fwd_jaxpr.in_aval_qdds, hi_args)
+             for lo_val in (aval.read_loval(x) if aval.has_qdd  # pyrefly: ignore[missing-attribute]
+                            else aval.lower_val(x))]  # pyrefly: ignore[missing-attribute]
+
+  all_outs = core.eval_jaxpr(lo_fwd_jaxpr.jaxpr, lo_fwd_jaxpr.consts,
+                              *lo_args)
+
+  lo_muts_out = sum(len(aval.lo_ty()) for aval in fwd_jaxpr.final_aval_qdds
+                    if aval.has_qdd)
+  out_mut, lo_outs = split_list(all_outs, [lo_muts_out])
+
+  out_mut_ = iter(out_mut)
+  in_idx = {v: i for i, v in enumerate(fwd_jaxpr.jaxpr.invars)}
+  for v in fwd_jaxpr.jaxpr.invars:
+    if (qdd := v.final_qdd) is not None:
+      lo_vals = it.islice(out_mut_, len(v.aval.lo_ty_qdd(qdd)))
+      v.aval.update_from_loval(qdd, hi_args[in_idx[v]], *lo_vals)  # pyrefly: ignore[missing-attribute]
+
+  lo_outs_ = iter(lo_outs)
+  hi_outs = [t.raise_val(*it.islice(lo_outs_, len(t.lo_ty())))
+             for t in fwd_jaxpr.out_avals]
+  assert next(lo_outs_, None) is None
+  return hi_outs
+
 remat_opt_p = core.Primitive("remat_opt")
 remat_opt_p.multiple_results = True
+remat_opt_p.is_high = lambda *_, fwd_jaxpr, **__: fwd_jaxpr.jaxpr.is_high
+remat_opt_p.to_lojax = _remat_opt_to_lojax
 remat_opt_p.def_impl(_remat_opt_impl)
 remat_opt_p.def_effectful_abstract_eval(_remat_opt_abstract_eval)
 mlir.register_lowering(remat_opt_p, mlir.lower_fun(

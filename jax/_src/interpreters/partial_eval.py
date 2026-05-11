@@ -317,7 +317,7 @@ class JaxprTrace(Trace):
     @_memoize
     def fwd_jaxpr_thunk(*zeros):
       fwd_ = _interleave_fun(fwd.with_unknown_names(), zeros)
-      fwd_jaxpr, _, consts = trace_to_jaxpr_dynamic(fwd_, in_avals)
+      fwd_jaxpr, _, consts = trace_to_jaxpr_dynamic(fwd_, in_avals, lower=self.requires_low)
       return fwd_jaxpr, consts
 
     name_stack = self._current_truncated_name_stack()
@@ -2003,6 +2003,7 @@ class DynamicJaxprTrace(core.Trace):
     in_tracers = map(to_jaxpr_tracer, in_tracers)
     # TODO(mattjj): check in_tracers are consistent with f.in_type annotation
     jaxpr, out_avals, consts = _cached_trace_to_jaxpr(f, in_type)
+    self.frame.is_high |= jaxpr.is_high
     if params.get('inline', False):
       return core.eval_jaxpr(jaxpr, consts, *in_tracers,
                              propagate_source_info=False)

@@ -712,6 +712,12 @@ class ShardMapPrimitive(core.Primitive):
   skip_canonicalization = True
 
   def bind_with_trace(self, trace, args, avals, params, /):
+    if trace.requires_low and self.is_high(*avals, **params):
+      with core.set_current_trace(trace):
+        return self.to_lojax(*args, **params)  # pyrefly: ignore[not-callable]
+    params = dict(params)
+    params.pop('jaxpr', None)
+    params.pop('out_specs', None)
     fun, = params.pop('subfuns')
     # fun returns a FlatTree containing a tuple of the user-level data and a flat,
     # broadcasted out_specs wrapped in `Static`.
@@ -719,11 +725,50 @@ class ShardMapPrimitive(core.Primitive):
     # doesn't include the `Static` out_specs.
     return trace.process_shard_map(shard_map_p, fun, args, **params)
 
+  def to_lojax(self, *hi_args, jaxpr, in_specs, out_specs, **params):
+    closed_jaxpr = core.ClosedJaxpr(jaxpr, ())
+    mesh = params['mesh']
+    manual_axes = params['manual_axes']
+    check_vma = params['check_vma']
+    inner_mesh = _as_manual_mesh(mesh, manual_axes)
+    with (_extend_axis_env(mesh, manual_axes), use_abstract_mesh(inner_mesh),
+          config._check_vma(check_vma)):
+      lo_closed_jaxpr = pe.lower_jaxpr2(closed_jaxpr)
+    if lo_closed_jaxpr.jaxpr.is_high:
+      raise TypeError("Lowering shard_map body JAXPR failed! High primitives remain in the lowered JAXPR.")
+
+
+    lo_args = [lo_val for aval, x in zip(closed_jaxpr.in_aval_qdds, hi_args)
+               for lo_val in (aval.read_loval(x) if aval.has_qdd  # pyrefly: ignore[missing-attribute]
+                              else aval.lower_val(x))]  # pyrefly: ignore[missing-attribute]
+
+    lo_in_specs = tuple(lo_spec for hi_spec in in_specs for lo_spec in hi_spec.to_lo())
+    lo_out_specs = tuple(lo_spec for hi_spec in out_specs for lo_spec in hi_spec.to_lo())
+
+    all_outs = self.bind(*lo_args, jaxpr=lo_closed_jaxpr.jaxpr,
+                         in_specs=lo_in_specs, out_specs=lo_out_specs, **params)
+
+    lo_muts_out = sum(len(aval.lo_ty()) for aval in closed_jaxpr.final_aval_qdds if aval.has_qdd)
+    out_mut, lo_outs = split_list(all_outs, [lo_muts_out])
+
+    out_mut_ = iter(out_mut)
+    in_idx = {v: i for i, v in enumerate(closed_jaxpr.jaxpr.invars)}
+    for v in closed_jaxpr.jaxpr.invars:
+      if (qdd := v.final_qdd) is not None:
+        lo_vals = it.islice(out_mut_, len(v.aval.lo_ty_qdd(qdd)))
+        v.aval.update_from_loval(qdd, hi_args[in_idx[v]], *lo_vals)  # pyrefly: ignore[missing-attribute]
+
+    lo_outs_ = iter(lo_outs)
+    hi_outs = [t.raise_val(*it.islice(lo_outs_, len(t.lo_ty())))
+               for t in closed_jaxpr.out_avals]
+    assert next(lo_outs_, None) is None
+    return hi_outs
+
   def get_bind_params(self, params):
     new_params = dict(params)
-    jaxpr = new_params.pop('jaxpr')
+    jaxpr = new_params['jaxpr']
     assert isinstance(jaxpr, core.Jaxpr)
-    axes = new_params.pop('out_specs')
+    axes = new_params['out_specs']
     def eval_jaxpr(*args):
       result = core.eval_jaxpr(jaxpr, (), *args)
       return FlatTree.flatten(result).with_aux(axes)
@@ -732,6 +777,7 @@ class ShardMapPrimitive(core.Primitive):
     return new_params
 
 shard_map_p = ShardMapPrimitive('shard_map')
+shard_map_p.is_high = lambda *_, jaxpr, **__: jaxpr.is_high
 
 # Staging
 
