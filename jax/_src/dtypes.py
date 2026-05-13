@@ -110,6 +110,13 @@ _float8_e4m3fnuz_dtype: np.dtype = np.dtype(float8_e4m3fnuz)
 _float8_e5m2_dtype: np.dtype = np.dtype(float8_e5m2)
 _float8_e5m2fnuz_dtype: np.dtype = np.dtype(float8_e5m2fnuz)
 
+# fp6 support
+float6_e2m3fn: type[np.generic] = ml_dtypes.float6_e2m3fn
+float6_e3m2fn: type[np.generic] = ml_dtypes.float6_e3m2fn
+
+_float6_e2m3fn_dtype: np.dtype = np.dtype(float6_e2m3fn)
+_float6_e3m2fn_dtype: np.dtype = np.dtype(float6_e3m2fn)
+
 # fp4 support
 float4_e2m1fn: type[np.generic] = ml_dtypes.float4_e2m1fn
 
@@ -128,6 +135,8 @@ _bfloat16_dtype: np.dtype = np.dtype(bfloat16)
 
 _custom_float_scalar_types = [
     float4_e2m1fn,
+    float6_e2m3fn,
+    float6_e3m2fn,
     float8_e3m4,
     float8_e4m3,
     float8_e8m0fnu,
@@ -140,6 +149,8 @@ _custom_float_scalar_types = [
 ]
 _custom_float_dtypes = [
     _float4_e2m1fn_dtype,
+    _float6_e2m3fn_dtype,
+    _float6_e3m2fn_dtype,
     _float8_e3m4_dtype,
     _float8_e4m3_dtype,
     _float8_e8m0fnu_dtype,
@@ -1057,13 +1068,31 @@ def lattice_result_type(*args: Any) -> tuple[DType, bool]:
   return out_dtype, (out_dtype != bool_) and out_weak_type
 
 @overload
-def result_type(*args: Any, return_weak_type_flag: Literal[True]) -> tuple[DType, bool]: ...
+
+
+def result_type(
+    *args: Any, return_weak_type_flag: Literal[True]
+) -> tuple[DType, bool]:
+  ...
+
 
 @overload
-def result_type(*args: Any, return_weak_type_flag: Literal[False] = False) -> DType: ...
+
+
+def result_type(
+    *args: Any, return_weak_type_flag: Literal[False] = False
+) -> DType:
+  ...
+
 
 @overload
-def result_type(*args: Any, return_weak_type_flag: bool = False) -> DType | tuple[DType, bool]: ...
+
+
+def result_type(
+    *args: Any, return_weak_type_flag: bool = False
+) -> DType | tuple[DType, bool]:
+  ...
+
 
 @export
 def result_type(*args: Any, return_weak_type_flag: bool = False) -> DType | tuple[DType, bool]:
