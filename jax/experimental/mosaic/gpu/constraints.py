@@ -67,12 +67,8 @@ class Variable:
     return f"V({self.key})"
 
 
-class Constant(abc.ABC):
-  """A constant is a known layout."""
-
-
 @dataclasses.dataclass(frozen=True)
-class RegisterLayout(Constant):
+class RegisterLayout:
   """Wraps a known register layout."""
 
   value: fa.FragmentedLayout
@@ -82,7 +78,7 @@ class RegisterLayout(Constant):
 
 
 @dataclasses.dataclass(frozen=True)
-class TMEMLayout(Constant):
+class TMEMLayout:
   """Wraps a known TMEM layout."""
 
   value: tcgen05.TMEMLayout
@@ -92,7 +88,7 @@ class TMEMLayout(Constant):
 
 
 @dataclasses.dataclass(frozen=True)
-class SMEMTiling(Constant):
+class SMEMTiling:
   """Wraps a known SMEM Tile Transform.
 
   If an SMEM reference may, in principle, have transforms but should not be
@@ -103,6 +99,9 @@ class SMEMTiling(Constant):
 
   def __str__(self):
     return f"C({self.value})"
+
+
+Constant = RegisterLayout | TMEMLayout | SMEMTiling
 
 
 @dataclasses.dataclass(frozen=True)
@@ -377,7 +376,7 @@ def reduce_expression(
 ) -> Expression | Unsatisfiable:
   """Reduces an expression as much as is possible given a set of known variable assignments."""
   match expr:
-    case Constant():
+    case RegisterLayout() | TMEMLayout() | SMEMTiling():
       return expr
     case Variable():
       return assignments.get(expr, expr)
@@ -394,10 +393,21 @@ def reduce_expression(
 
 
 @dataclasses.dataclass(frozen=True)
+class AlwaysTrue:
+  def holds(self) -> bool | None:
+    return True
+
+
+@dataclasses.dataclass(frozen=True)
 class Equals:
   """States that `lhs` and `rhs` are equal."""
   lhs: Expression
   rhs: Expression
+
+  def canonicalize(self) -> Constraint:
+    if self.lhs == self.rhs:
+      return AlwaysTrue()
+    return self
 
   def holds(self) -> bool | None:
     if self.lhs == self.rhs:
@@ -466,6 +476,8 @@ class Relayout:
   strict: bool = False
 
   def canonicalize(self) -> Constraint:
+    if self.source == self.target:
+      return AlwaysTrue()
     match self:
       # The only valid strict tiled and strided relayout is the identity.
       case Relayout(
@@ -584,9 +596,9 @@ class IsTransferableTmemRegisters(IsTransferable):
         return self.is_valid_tmem_transfer(dst, src)
       case TMEMLayout(value=src), RegisterLayout(value=dst):
         return self.is_valid_tmem_transfer(src, dst)
-      case Constant(), Constant():
+      case src, dst if isinstance(src, Constant) and isinstance(dst, Constant):
         raise ValueError(
-            f"{self.source} -> {self.target} is not a TMEM <-> Registers"
+            f"{src} -> {dst} is not a TMEM <-> Registers"
             " transfer."
         )
       case _:
@@ -696,10 +708,9 @@ class IsTransferableSmemRegisters(IsTransferable):
         return self._is_supported_smem_transfer(src, dst)
       case RegisterLayout(value=src), SMEMTiling(value=dst):
         return self._is_supported_smem_transfer(dst, src)
-      case Constant(), Constant():
+      case src, dst if isinstance(src, Constant) and isinstance(dst, Constant):
         raise ValueError(
-            f"{self.source} -> {self.target} is not a SMEM <-> Registers"
-            " transfer."
+            f"{src} -> {dst} is not a SMEM <-> Registers transfer."
         )
       case _:
         return None
@@ -800,7 +811,7 @@ class MinorDimDivisibleBy:
         return True
       case SMEMTiling(value=lc.TileTransform(tiling=t)):
         tiling = t
-      case Constant() as c:
+      case c if isinstance(c, Constant):
         raise ValueError(f"Unexpected value {c} in MinorDimDivisibleBy constraint")
       case _:
         return None
@@ -868,7 +879,7 @@ class IsSupportedBroadcast:
         # This is an intentionally loose check. We rely on the presence of a
         # `src = Reduce(dst)` constraint to enforce correctness.
         return type(src_layout) == type(dst_layout)
-      case Constant() as src, Constant() as dst:
+      case src, dst if isinstance(src, Constant) and isinstance(dst, Constant):
         raise ValueError(
             f"Unexpected values {src=} {dst=} in IsSupportedBroadcast"
             " constraint"
@@ -892,6 +903,7 @@ Constraint = (
     | Divides
     | IsSupportedBroadcast
     | MinorDimDivisibleBy
+    | AlwaysTrue
 )
 
 
@@ -908,7 +920,7 @@ def reduce_constraint(
       rhs_red = reduce_expression(rhs, assignments)
       if isinstance(rhs_red, Unsatisfiable):
         return Unsatisfiable()
-      return Equals(lhs_red, rhs_red)
+      return Equals(lhs_red, rhs_red).canonicalize()
     case Relayout(source=source, target=target) as relayout:
       source_red = reduce_expression(source, assignments)
       target_red = reduce_expression(target, assignments)
@@ -954,6 +966,8 @@ def reduce_constraint(
       ):
         return Unsatisfiable()
       return IsSupportedBroadcast(src_red, dst_red, dims)
+    case AlwaysTrue():
+      return constraint
     case _ as never:
       assert_never(never)
 
@@ -982,7 +996,7 @@ class ConstraintSystem:
           if expr not in seen_variables and expr not in self.assignments:
             seen_variables.add(expr)
             free_variables.append(expr)
-        case Constant():
+        case cst if isinstance(cst, Constant):
           ...
         case Reduce(expression=e):
           extract_variables(e)
@@ -1016,6 +1030,8 @@ class ConstraintSystem:
         case IsSupportedBroadcast(src=src, dst=dst):
           extract_variables(src)
           extract_variables(dst)
+        case AlwaysTrue():
+          ...
         case _ as never:
           assert_never(never)
     return free_variables
@@ -1311,11 +1327,11 @@ def _reduce_system_once(
     match reduce_constraint(constraint, assignments):
       case Unsatisfiable():
         return Unsatisfiable()
-      case Equals(lhs=Variable() as var, rhs=Constant() as cst):
+      case Equals(lhs=Variable() as var, rhs=cst) if isinstance(cst, Constant):
         if not try_assign(var, cst):
           return Unsatisfiable()
         changed = True
-      case Equals(lhs=Constant() as cst, rhs=Variable() as var):
+      case Equals(lhs=cst, rhs=Variable() as var) if isinstance(cst, Constant):
         if not try_assign(var, cst):
           return Unsatisfiable()
         changed = True
