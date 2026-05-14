@@ -365,6 +365,7 @@ def lower_jaxpr_into_module(
       dynamic_shape_replacement_fn=dynamic_shape_replacement_fn,
   )
   sym_tab = ir.SymbolTable(module.operation)
+  cache = {}
   func_op = lower_jaxpr_to_func(
       jaxpr,
       name=name,
@@ -372,6 +373,9 @@ def lower_jaxpr_into_module(
       mosaic_grid_mapping=mosaic_grid_mapping,
       forward_compatible=lowering_context.is_forward_compat(),
       backend=backend,
+      module=module,
+      symbol_table=sym_tab,
+      lowering_cache=cache,
       needs_layout_passes=needs_layout_passes,
   )
   module.body.append(func_op)
@@ -399,6 +403,9 @@ def lower_jaxpr_into_module(
         forward_compatible=lowering_context.is_forward_compat(),
         backend=backend,
         dynamic_shape_replacement_fn=dynamic_shape_replacement_fn,
+        module=module,
+        symbol_table=sym_tab,
+        lowering_cache=cache,
     )
     assert mlir_func.verify(), mlir_func
     module.body.append(mlir_func)
@@ -422,6 +429,9 @@ def lower_jaxpr_to_func(
     mosaic_grid_mapping: MosaicGridMapping,
     forward_compatible: bool,
     backend: Any | None,
+    module: ir.Module,
+    symbol_table: ir.SymbolTable,
+    lowering_cache: dict[tc_lowering.PallasLoweringCacheKey, func.FuncOp],
     needs_layout_passes: bool = False,
 ) -> func.FuncOp:
   """Lowers a Jaxpr to a Mosaic SparseCore function."""
@@ -467,6 +477,9 @@ def lower_jaxpr_to_func(
         forward_compatible=forward_compatible,
         backend=backend,
         dynamic_shape_replacement_fn=dynamic_shape_replacement_fn,
+        module=module,
+        symbol_table=symbol_table,
+        lowering_cache=lowering_cache,
         needs_layout_passes=needs_layout_passes,
     )
     return tc_lowering.jaxpr_subcomp(

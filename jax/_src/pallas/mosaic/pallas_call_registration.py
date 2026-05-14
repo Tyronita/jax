@@ -445,6 +445,8 @@ def pallas_call_tpu_lowering_rule(
         mesh=jax_mesh,
         dynamic_shape_replacement_enabled=pallas_core.dynamic_shapes_export_enabled(),
     )
+    pm = passmanager.PassManager.parse("builtin.module(symbol-dce)", mlir_ctx)
+    pm.run(mosaic_module.operation)
 
   if debug:
     pm = passmanager.PassManager.parse("builtin.module(canonicalize)", mlir_ctx)
@@ -677,6 +679,8 @@ def mpmd_map_tpu_lowering_rule(
           dynamic_shape_replacement_enabled=pallas_core.dynamic_shapes_export_enabled(),
           num_scratch=num_scratch,
       )
+    pm = passmanager.PassManager.parse("builtin.module(symbol-dce)", mlir_ctx)
+    pm.run(mosaic_module.operation)
 
   if debug:
     pm = passmanager.PassManager.parse("builtin.module(canonicalize)", mlir_ctx)
