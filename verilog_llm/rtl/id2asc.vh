@@ -1,0 +1,31 @@
+// Auto-generated id->ascii decoder.
+function [7:0] id2asc; input integer id; begin case(id)
+  0: id2asc = 8'd32;
+  1: id2asc = 8'd46;
+  2: id2asc = 8'd97;
+  3: id2asc = 8'd98;
+  4: id2asc = 8'd99;
+  5: id2asc = 8'd100;
+  6: id2asc = 8'd101;
+  7: id2asc = 8'd102;
+  8: id2asc = 8'd103;
+  9: id2asc = 8'd104;
+  10: id2asc = 8'd105;
+  11: id2asc = 8'd106;
+  12: id2asc = 8'd107;
+  13: id2asc = 8'd108;
+  14: id2asc = 8'd109;
+  15: id2asc = 8'd110;
+  16: id2asc = 8'd111;
+  17: id2asc = 8'd112;
+  18: id2asc = 8'd113;
+  19: id2asc = 8'd114;
+  20: id2asc = 8'd115;
+  21: id2asc = 8'd116;
+  22: id2asc = 8'd117;
+  23: id2asc = 8'd118;
+  24: id2asc = 8'd119;
+  25: id2asc = 8'd120;
+  26: id2asc = 8'd121;
+  27: id2asc = 8'd122;
+  default: id2asc = 8'd63; endcase end endfunction
