@@ -10,6 +10,16 @@ verified **bit-exact** against a Python golden model.
   PASS: hardware output is bit-exact with the golden model (24 tokens).
 ```
 
+## Documentation
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — model dataflow, hardware block
+  diagram, and the bit-exact build/verify flow (with diagrams).
+- [docs/FPGA_TO_ASIC.md](docs/FPGA_TO_ASIC.md) — how to get this onto an FPGA and
+  then an ASIC, and what the RTL needs before it's silicon-ready.
+- [docs/COST.md](docs/COST.md) — FPGA/ASIC cost breakdown and an honest
+  "is it worth it?" verdict.
+- [PUBLISH.md](PUBLISH.md) — turn this directory into its own standalone repo.
+
 ## What it is
 
 A decoder-only transformer (the same architecture family as GPT), shrunk so it
